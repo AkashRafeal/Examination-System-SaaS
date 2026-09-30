@@ -6,6 +6,7 @@ export { Difficulty };
 // Category and Question Bank Management Service
 import { RawParsedQuestion } from '../parsers/question-parser';
 import { invalidateQuestionCache } from '@/lib/cache/question-cache';
+import crypto from 'crypto';
 
 export interface QuestionFilters {
   page?: number;
@@ -383,25 +384,31 @@ export async function confirmImportBatch(params: {
 }) {
   const validQuestions = params.questions.filter((q) => q.isValid);
 
-  const batch = await db.$transaction(async (tx: any) => {
-    // 1. Create ImportBatch
-    const createdBatch = await tx.importBatch.create({
-      data: {
-        fileName: params.fileName,
-        fileType: params.fileType,
-        totalQuestions: params.questions.length,
-        validQuestions: validQuestions.length,
-        invalidQuestions: params.questions.length - validQuestions.length,
-        importedQuestions: validQuestions.length,
-        uploadedBy: params.uploadedBy,
-        createdById: params.createdById || null,
-      },
-    });
-
-    // 2. Insert valid questions and their options
-    for (const q of validQuestions) {
-      const createdQuestion = await tx.question.create({
+  const batch = await db.$transaction(
+    async (tx: any) => {
+      // 1. Create ImportBatch
+      const createdBatch = await tx.importBatch.create({
         data: {
+          fileName: params.fileName,
+          fileType: params.fileType,
+          totalQuestions: params.questions.length,
+          validQuestions: validQuestions.length,
+          invalidQuestions: params.questions.length - validQuestions.length,
+          importedQuestions: validQuestions.length,
+          uploadedBy: params.uploadedBy,
+          createdById: params.createdById || null,
+        },
+      });
+
+      if (validQuestions.length === 0) {
+        return createdBatch;
+      }
+
+      // 2. Prepare bulk insert arrays with unique UUIDs
+      const questionsData = validQuestions.map((q) => {
+        const questionId = crypto.randomUUID();
+        return {
+          id: questionId,
           questionText: q.questionText,
           categoryId: params.categoryId || null,
           difficulty: params.difficulty || Difficulty.MEDIUM,
@@ -409,21 +416,37 @@ export async function confirmImportBatch(params: {
           createdById: params.createdById || null,
           sourceFileName: params.fileName,
           sourceImportId: createdBatch.id,
-        },
+          rawOptions: q.options,
+          correctAnswer: q.correctAnswer,
+        };
       });
 
-      await tx.questionOption.createMany({
-        data: q.options.map((opt) => ({
-          questionId: createdQuestion.id,
+      const optionsData = questionsData.flatMap((q) =>
+        q.rawOptions.map((opt) => ({
+          questionId: q.id,
           optionKey: opt.key.toUpperCase(),
           optionText: opt.text,
           isCorrect: opt.key.toUpperCase() === q.correctAnswer.toUpperCase(),
-        })),
-      });
-    }
+        }))
+      );
 
-    return createdBatch;
-  });
+      // 3. Bulk insert questions in a single query
+      await tx.question.createMany({
+        data: questionsData.map(({ rawOptions, correctAnswer, ...q }) => q),
+      });
+
+      // 4. Bulk insert all options in a single query
+      await tx.questionOption.createMany({
+        data: optionsData,
+      });
+
+      return createdBatch;
+    },
+    {
+      maxWait: 15000,
+      timeout: 60000,
+    }
+  );
 
   invalidateQuestionCache();
   return batch;
